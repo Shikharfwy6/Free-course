@@ -43,7 +43,8 @@ CHANNELS = {
     "5": "-1003307449853",
     "6": "-1003901369992",
     "7": "-1003400249450",
-    "8": "-1003211122364"
+    "8": "-1003211122364",
+    "50": "-1004436088044" # Add secondary backup if needed
 }
 
 SHORTENERS = {
@@ -288,7 +289,6 @@ async def handle_text_messages(update: Update, context: ContextTypes.DEFAULT_TYP
             ready_list = user_data.get("ready_user", []) if user_data else []
 
             if user_type != "premium":
-                # Max 3 Unique Links Limit Logic
                 if raw_arg and raw_arg not in ready_list and len(ready_list) >= 3:
                     await bot.send_message(
                         chat_id=chat_id, 
@@ -298,16 +298,11 @@ async def handle_text_messages(update: Update, context: ContextTypes.DEFAULT_TYP
 
             # --- PROCESS AND DELIVER CONTENT ---
             extracted_args = raw_arg.split('_') if "_" in raw_arg else [raw_arg]
-            
-            # Update Unique Link History in MongoDB (ready_user field)
-            if raw_arg and user_type != "premium":
-                users_col.update_one(
-                    {"_id": user_id},
-                    {"$addToSet": {"ready_user": raw_arg}}
-                )
 
-            # Batch Mode
+            # 1. BATCH MODE (4 Parameters: start_end_ch_parts)
             if len(extracted_args) == 4:
+                if raw_arg and user_type != "premium":
+                    users_col.update_one({"_id": user_id}, {"$addToSet": {"ready_user": raw_arg}})
                 start_id, end_id, ch_num, total_parts = map(int, extracted_args)
                 video_list = list(range(start_id, end_id + 1))
                 target_ch = CHANNELS.get(str(ch_num))
@@ -318,29 +313,44 @@ async def handle_text_messages(update: Update, context: ContextTypes.DEFAULT_TYP
                 USER_STATES[user_id] = {"video_list": video_list, "target_ch": target_ch, "videos_per_part": videos_per_part, "current_part": 1, "total_parts": total_parts, "total_videos": total_videos}
                 await bot.send_message(chat_id=chat_id, text=f"📊 **Files Ready!**\nTotal Files: `{total_videos}`")
                 await send_video_batch(chat_id, bot, user_id)
+                return
                 
-            # Single File Mode
-            elif len(extracted_args) == 2:
-                file_id, ch_num = extracted_args
+            # 2. SINGLE FILE MODE (2 or 3 Parameters: file_id_ch_num or file_id_ch_num_extra)
+            elif len(extracted_args) in [2, 3]:
+                if raw_arg and user_type != "premium":
+                    users_col.update_one({"_id": user_id}, {"$addToSet": {"ready_user": raw_arg}})
+                
+                file_id = extracted_args[0]
+                ch_num = extracted_args[1]
                 target_ch = CHANNELS.get(str(ch_num))
+                
                 if target_ch:
-                    sent_msg = await bot.copy_message(chat_id=chat_id, from_chat_id=target_ch, message_id=int(file_id))
-                    
-                    now = datetime.utcnow()
-                    delete_at = now + timedelta(minutes=5)
-                    
-                    users_col.update_one(
-                        {"_id": user_id},
-                        {"$push": {
-                            "active_files": {
-                                "message_id": sent_msg.message_id,
-                                "give_time": now,
-                                "delete_at": delete_at
-                            }
-                        }}
-                    )
+                    try:
+                        sent_msg = await bot.copy_message(chat_id=chat_id, from_chat_id=target_ch, message_id=int(file_id))
+                        now = datetime.utcnow()
+                        delete_at = now + timedelta(minutes=5)
+                        
+                        users_col.update_one(
+                            {"_id": user_id},
+                            {"$push": {
+                                "active_files": {
+                                    "message_id": sent_msg.message_id,
+                                    "give_time": now,
+                                    "delete_at": delete_at
+                                }
+                            }}
+                        )
+                    except Exception as e:
+                        await bot.send_message(chat_id=chat_id, text="⚠️ Requested video database channel par nahi mil saki.")
+                else:
+                    await bot.send_message(chat_id=chat_id, text="❌ Invalid Channel ID in link.")
+                return
+                
+            # 3. NO LINK / WELCOME COMMAND
             else:
-                current_count = len(ready_list) if user_type != "premium" else "Unlimited"
+                updated_user = users_col.find_one({"_id": user_id})
+                updated_ready = updated_user.get("ready_user", []) if updated_user else []
+                current_count = len(updated_ready) if user_type != "premium" else "Unlimited"
                 await bot.send_message(chat_id=chat_id, text=f"👋 **Welcome Back!**\nAapka verification active hai.\nUsed Videos: **{current_count}/3** (Different Links)")
             return
     except Exception as err:
@@ -420,7 +430,7 @@ ptb_app.add_handler(CallbackQueryHandler(handle_button_clicks))
 
 @app.route('/', methods=['GET'])
 def index():
-    return "Bot is running with Updated Limits and Force-Subscribe logic!", 200
+    return "Bot is running with Fixed Dynamic Links!", 200
 
 @app.route('/webhook', methods=['POST'])
 def telegram_webhook():
