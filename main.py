@@ -29,7 +29,7 @@ ADMIN_ID = 8838634478  # ✅ Admin ID
 
 # Mandatory Force Subscribe Configuration
 FORCE_SUB_CHANNEL_ID = -1004436088044
-FORCE_SUB_LINK = "https://t.me/+4EUrlpXmI2lhYjll"
+FORCE_SUB_LINK = "https://t.me/+ylTj1bpH3kY3MTFl"
 
 if not BOT_TOKEN or not MONGO_URI:
     print("💥 Critical Error: BOT_TOKEN ya MONGO_URI missing hai!", flush=True)
@@ -44,7 +44,7 @@ CHANNELS = {
     "6": "-1003901369992",
     "7": "-1003400249450",
     "8": "-1003211122364",
-    "50": "-1004436088044" # Add secondary backup if needed
+    "50": "-1004436088044"
 }
 
 SHORTENERS = {
@@ -76,16 +76,18 @@ ptb_app.bot._bot_user = telegram.User(id=int(BOT_TOKEN.split(':')[0]), is_bot=Tr
 
 IST = pytz.timezone('Asia/Kolkata')
 
-# --- ⏱️ FORCE SUBSCRIBE CHECKER ---
+# --- ⏱️ ACCURATE FORCE SUBSCRIBE CHECKER ---
 async def is_user_subscribed(bot, user_id):
     try:
         member = await bot.get_chat_member(chat_id=FORCE_SUB_CHANNEL_ID, user_id=user_id)
-        if member.status in ['creator', 'administrator', 'member']:
+        # Checking all valid status types
+        if member.status in ['creator', 'administrator', 'member', 'restricted']:
             return True
         return False
     except TelegramError as e:
-        print(f"⚠️ Channel Check Error: {e}", flush=True)
-        return False
+        print(f"⚠️ Channel Member Check Error: {e}", flush=True)
+        # Fallback: Agar bot permission issue ki wajah se check nahi kar pa raha toh user ko block na karein
+        return True
 
 # --- ⏱️ VERCEL CLEANUP FUNCTION ---
 async def clean_expired_files(bot, user_id, chat_id):
@@ -211,9 +213,12 @@ async def handle_text_messages(update: Update, context: ContextTypes.DEFAULT_TYP
     # 1. FORCE SUBSCRIBE CHECK
     subscribed = await is_user_subscribed(bot, user_id)
     if not subscribed:
+        start_param = text_message.replace('/start ', '').strip()
+        retry_link = f"https://t.me/{BOT_USERNAME}?start={start_param}" if start_param and start_param != "/start" else f"https://t.me/{BOT_USERNAME}?start=start"
+        
         keyboard = [
             [InlineKeyboardButton("📢 Join Channel", url=FORCE_SUB_LINK)],
-            [InlineKeyboardButton("🔄 Try Again", url=f"https://t.me/{BOT_USERNAME}?start={text_message.replace('/start ', '')}")]
+            [InlineKeyboardButton("🔄 Try Again", url=retry_link)]
         ]
         await bot.send_message(
             chat_id=chat_id,
@@ -430,7 +435,7 @@ ptb_app.add_handler(CallbackQueryHandler(handle_button_clicks))
 
 @app.route('/', methods=['GET'])
 def index():
-    return "Bot is running with Fixed Dynamic Links!", 200
+    return "Bot is running with Fixed Force Subscribe Check!", 200
 
 @app.route('/webhook', methods=['POST'])
 def telegram_webhook():
