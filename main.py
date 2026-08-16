@@ -29,7 +29,7 @@ ADMIN_ID = 8838634478  # ✅ Admin ID
 
 # Mandatory Force Subscribe Configuration
 FORCE_SUB_CHANNEL_ID = -1004436088044
-FORCE_SUB_LINK = "https://t.me/+ylTj1bpH3kY3MTFl"
+FORCE_SUB_LINK = "https://t.me/+4EUrlpXmI2lhYjll"
 
 if not BOT_TOKEN or not MONGO_URI:
     print("💥 Critical Error: BOT_TOKEN ya MONGO_URI missing hai!", flush=True)
