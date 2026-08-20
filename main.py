@@ -3,18 +3,14 @@ import asyncio
 import sys
 import traceback
 import math
-import secrets
-import string
-import requests
 import os
 import telegram
 from datetime import datetime, timedelta
 import pytz  
-from pymongo import MongoClient
 from flask import Flask, request, jsonify
+from pymongo import MongoClient
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, MessageHandler, CallbackQueryHandler, CommandHandler, filters, ContextTypes
-from telegram.error import TelegramError
+from telegram.ext import Application, MessageHandler, CallbackQueryHandler, CommandHandler, ChatJoinRequestHandler, filters, ContextTypes
 
 # --- LOGGING SETUP ---
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO, stream=sys.stdout)
@@ -27,9 +23,10 @@ MONGO_URI = os.getenv("MONGO_URI")
 BOT_USERNAME = "Course_give_bot"
 ADMIN_ID = 8838634478  # ✅ Admin ID
 
-# Mandatory Force Subscribe Configuration
-FORCE_SUB_CHANNEL_ID = -1004436088044
-FORCE_SUB_LINK = "https://t.me/+ylTj1bpH3kY3MTFl"
+FORCE_SUB_CHANNELS = [
+    {"id": -1004436088044, "name": "📢 Main Channel", "link": "https://t.me/+4EUrlpXmI2lhYjll"},
+    {"id": -1003880324982, "name": "🔒 Backup Channel (Req to Join)", "link": "https://t.me/+RuLFx8y292s0OTFl"}
+]
 
 if not BOT_TOKEN or not MONGO_URI:
     print("💥 Critical Error: BOT_TOKEN ya MONGO_URI missing hai!", flush=True)
@@ -43,14 +40,7 @@ CHANNELS = {
     "5": "-1003307449853",
     "6": "-1003901369992",
     "7": "-1003400249450",
-    "8": "-1003211122364",
-    "50": "-1004436088044"
-}
-
-SHORTENERS = {
-    "arolinks": "https://arolinks.com/api?api=f4617908b561110a219cd2b65bc255c2c2c6ff8a&url={url}",
-    "vplink": "https://vplink.in/api?api=017ab25e4402465d00047e8e2897f3c6b38afbd9&url={url}",
-    "instantlinks": "https://instantlinks.co/api?api=323c4585c0d0b8bc04a170cd57a2e6a74ac6d8aa&url={url}"
+    "8": "-1003211122364"
 }
 
 # --- MONGODB SETUP ---
@@ -58,16 +48,14 @@ try:
     mongo_client = MongoClient(MONGO_URI, maxPoolSize=5, minPoolSize=1, waitQueueTimeoutMS=2000, retryWrites=True)
     db = mongo_client["cluster_bot_db2"]
     users_col = db["verified_users2"]
-    print("✅ MongoDB Connected!", flush=True)
+    settings_col = db["settings"]
+    requests_col = db["join_requests"]
+    print("✅ MongoDB Connected Successfully!", flush=True)
 except Exception as e:
     print(f"💥 MongoDB Connection Error: {e}", flush=True)
     sys.exit(1)
 
 USER_STATES = {}
-session = requests.Session()
-session.headers.update({
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-})
 
 app = Flask(__name__)
 ptb_app = Application.builder().token(BOT_TOKEN).build()
@@ -76,20 +64,44 @@ ptb_app.bot._bot_user = telegram.User(id=int(BOT_TOKEN.split(':')[0]), is_bot=Tr
 
 IST = pytz.timezone('Asia/Kolkata')
 
-# --- ⏱️ ACCURATE FORCE SUBSCRIBE CHECKER ---
-async def is_user_subscribed(bot, user_id):
-    try:
-        member = await bot.get_chat_member(chat_id=FORCE_SUB_CHANNEL_ID, user_id=user_id)
-        # Checking all valid status types
-        if member.status in ['creator', 'administrator', 'member', 'restricted']:
-            return True
-        return False
-    except TelegramError as e:
-        print(f"⚠️ Channel Member Check Error: {e}", flush=True)
-        # Fallback: Agar bot permission issue ki wajah se check nahi kar pa raha toh user ko block na karein
-        return True
+# --- 📩 CHAT JOIN REQUEST HANDLER ---
+async def handle_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_join_request = update.chat_join_request
+    if not chat_join_request:
+        return
+    
+    user_id = chat_join_request.from_user.id
+    chat_id = chat_join_request.chat.id
 
-# --- ⏱️ VERCEL CLEANUP FUNCTION ---
+    requests_col.update_one(
+        {"user_id": user_id, "chat_id": chat_id},
+        {"$set": {"requested_at": datetime.utcnow()}},
+        upsert=True
+    )
+
+# --- 🔒 MULTI-CHANNEL FORCE SUBSCRIBE CHECK ---
+async def check_user_subscriptions(bot, user_id):
+    unsubscribed_channels = []
+    
+    for ch in FORCE_SUB_CHANNELS:
+        ch_id = ch["id"]
+        
+        try:
+            member = await bot.get_chat_member(chat_id=ch_id, user_id=user_id)
+            if member.status in ['creator', 'administrator', 'member']:
+                continue
+        except Exception:
+            pass
+
+        has_requested = requests_col.find_one({"user_id": user_id, "chat_id": ch_id})
+        if has_requested:
+            continue
+
+        unsubscribed_channels.append(ch)
+
+    return unsubscribed_channels
+
+# --- ⏱️ CLEANUP EXPIRED MESSAGES ---
 async def clean_expired_files(bot, user_id, chat_id):
     try:
         user = users_col.find_one({"_id": user_id})
@@ -117,59 +129,98 @@ async def clean_expired_files(bot, user_id, chat_id):
         print(f"❌ Error in clean_expired_files: {e}", flush=True)
 
 # --- HELPER FUNCTIONS ---
-def get_short_link(api_name, long_url):
-    try:
-        api_url = SHORTENERS[api_name].format(url=long_url)
-        response = session.get(api_url, timeout=5)
-        if response.status_code == 200:
-            res_text = response.text.strip()
-            if "https://" in res_text or "http://" in res_text:
-                return res_text
-            return response.json().get("shortenedUrl", None)
-    except Exception as e:
-        print(f"❌ Shortener Error ({api_name}): {e}", flush=True)
-    return None
-
 def check_user_verification(user_id):
     try:
         user = users_col.find_one({"_id": user_id})
         now = datetime.utcnow()
         
         if user:
+            # 👑 Premium users have no limits
             if user.get("User") == "premium":
-                return True, user
+                return True, "verified", user
 
-            if user.get("expire_at") and user.get("expire_at").replace(tzinfo=pytz.utc) < now.replace(tzinfo=pytz.utc):
+            last_date = user.get("last_verified_date")
+            today_str = now.strftime("%Y-%m-%d")
+
+            # Date check to reset limit daily
+            if last_date != today_str:
                 users_col.update_one(
-                    {"_id": user_id}, 
-                    {"$set": {"status": "unverified", "ready_user": []}}
+                    {"_id": user_id},
+                    {"$set": {"usage_count": 0, "status": "unverified", "last_verified_date": today_str}}
                 )
+                user["usage_count"] = 0
                 user["status"] = "unverified"
-                user["ready_user"] = []
-                return False, user
+
+            # Check daily usage limit for non-premium
+            usage_count = user.get("usage_count", 0)
+            if usage_count >= 3:
+                return False, "limit_exceeded", user
 
             if user.get("status") == "verified":
-                return True, user
+                return True, "verified", user
                 
-            return False, user
+            return False, "unverified", user
     except Exception as e:
         print(f"⚠️ MongoDB Read Fail: {e}", flush=True)
-    return False, None
+    return False, "unverified", None
 
-def generate_random_token(length=12):
-    return "v_" + ''.join(secrets.choice(string.ascii_lowercase + string.digits) for _ in range(length))
+def increment_user_usage(user_id):
+    user = users_col.find_one({"_id": user_id})
+    if user and user.get("User") != "premium":
+        new_count = user.get("usage_count", 0) + 1
+        update_data = {"usage_count": new_count}
+        
+        # After 3 links used, mark status unverified so they must verify next day
+        if new_count >= 3:
+            update_data["status"] = "unverified"
+            
+        users_col.update_one({"_id": user_id}, {"$set": update_data})
 
-def make_nested_link(steps, target_url):
-    current_url = target_url
-    for step in steps:
-        short = get_short_link(step, current_url)
-        if short:
-            current_url = short
-        else:
-            print(f"⚠️ Chain shortener failed for {step}", flush=True)
-    return current_url
+def get_setting(key):
+    setting = settings_col.find_one({"_id": key})
+    if setting and "value" in setting:
+        return setting["value"]
+    return None
 
-# --- ADMIN COMMAND HANDLER (/p) ---
+# --- ADMIN COMMANDS ---
+async def handle_todaylink_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id != ADMIN_ID:
+        await update.message.reply_text("❌ Unauthorized!")
+        return
+
+    if not context.args:
+        await update.message.reply_text("💡 **Sahi Format:** `/todaylink https://vplink.in/KNrExH`")
+        return
+
+    new_link = context.args[0].strip()
+    settings_col.update_one(
+        {"_id": "today_link"},
+        {"$set": {"value": new_link, "updated_at": datetime.utcnow()}},
+        upsert=True
+    )
+    await update.message.reply_text(f"✅ **Today's Short Link Updated!**\n\n🔗 Short Link: `{new_link}`")
+
+async def handle_todaycheck_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id != ADMIN_ID:
+        await update.message.reply_text("❌ Unauthorized!")
+        return
+
+    if not context.args:
+        await update.message.reply_text("💡 **Sahi Format:** `/todaycheck verifyiquahavVahqjqba`")
+        return
+
+    input_text = context.args[0].strip()
+    secret_token = input_text.split("start=")[-1] if "start=" in input_text else input_text
+
+    settings_col.update_one(
+        {"_id": "today_check_token"},
+        {"$set": {"value": secret_token, "updated_at": datetime.utcnow()}},
+        upsert=True
+    )
+    await update.message.reply_text(f"🔑 **Secret Verification Token Set!**\n\n🎯 Active Token: `{secret_token}`")
+
 async def handle_premium_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id != ADMIN_ID:
@@ -187,18 +238,18 @@ async def handle_premium_command(update: Update, context: ContextTypes.DEFAULT_T
             {"$set": {
                 "User": "premium",
                 "status": "verified",
-                "ready_user": [],
+                "available_request": "unlimited",
                 "expire_at": None
             }},
             upsert=True
         )
-        await update.message.reply_text(f"👑 **Success!** User `{target_uid}` ko **Unlimited Premium** member bana diya gaya hai.")
+        await update.message.reply_text(f"👑 **Success!** User `{target_uid}` ko lifelong **Premium** member bana diya gaya hai.")
     except ValueError:
         await update.message.reply_text("❌ Invalid User ID!")
     except Exception as e:
         await update.message.reply_text(f"⚠️ Error: {e}")
 
-# --- COMMAND & TEXT/MEDIA HANDLERS ---
+# --- MAIN MESSAGE & COMMAND HANDLER ---
 async def handle_text_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
         return
@@ -208,173 +259,145 @@ async def handle_text_messages(update: Update, context: ContextTypes.DEFAULT_TYP
     user_id = update.effective_user.id
     text_message = update.message.text.strip() if update.message.text else ""
     
-    await clean_expired_files(bot, user_id, chat_id)
-
-    # 1. FORCE SUBSCRIBE CHECK
-    subscribed = await is_user_subscribed(bot, user_id)
-    if not subscribed:
-        start_param = text_message.replace('/start ', '').strip()
-        retry_link = f"https://t.me/{BOT_USERNAME}?start={start_param}" if start_param and start_param != "/start" else f"https://t.me/{BOT_USERNAME}?start=start"
+    # 🚨 1. MULTI-CHANNEL FORCE SUBSCRIBE CHECK
+    unsubscribed = await check_user_subscriptions(bot, user_id)
+    if unsubscribed:
+        keyboard = []
+        for ch in unsubscribed:
+            keyboard.append([InlineKeyboardButton(f"🔗 Join {ch['name']}", url=ch["link"])])
         
-        keyboard = [
-            [InlineKeyboardButton("📢 Join Channel", url=FORCE_SUB_LINK)],
-            [InlineKeyboardButton("🔄 Try Again", url=retry_link)]
-        ]
+        start_param = text_message.split()[1] if len(text_message.split()) > 1 else ""
+        try_again_url = f"https://t.me/{BOT_USERNAME}?start={start_param}" if start_param else f"https://t.me/{BOT_USERNAME}"
+        keyboard.append([InlineKeyboardButton("🔄 Try Again", url=try_again_url)])
+
         await bot.send_message(
             chat_id=chat_id,
-            text="⚠️ **Access Denied!**\n\nBot ko istemal karne ke liye pehle hamare official Telegram channel ko join karein:",
+            text="❌ **Access Denied!**\n\nBot ko use karne ke liye neeche diye gaye saare channels ko join karein ya Request Bhejein. Phir **Try Again** par click karein.",
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
         return
 
+    await clean_expired_files(bot, user_id, chat_id)
+    
     try:
         if text_message.startswith("/start"):
             parts = text_message.split()
             raw_arg = parts[1] if len(parts) > 1 else ""
             
-            # --- VERIFICATION TOKEN CALLBACK ---
-            if raw_arg.startswith("v_verify_"):
-                search_query = {"_id": user_id, "verification_token": raw_arg}
-                user_record = users_col.find_one(search_query)
-                
-                if user_record:
-                    now = datetime.utcnow()
-                    expire_time = now + timedelta(hours=24)
-
-                    users_col.update_one(
-                        {"_id": user_id},
-                        {"$set": {
-                            "status": "verified",
-                            "User": user_record.get("User", "normal"),
-                            "ready_user": [],
-                            "expire_at": expire_time
-                        },
-                        "$unset": {
-                            "verification_token": ""
-                        }}
-                    )
-                    await bot.send_message(chat_id=chat_id, text="✅ **Verification Successful!**\n\nAapko **24 Ghante** ke liye 3 unique videos fetch karne ki permission mil gayi hai.")
-                else:
-                    await bot.send_message(chat_id=chat_id, text="❌ Invalid ya Expired verification link!")
-                return
-
-            # --- VERIFICATION STATUS CHECK ---
-            is_verified, user_data = check_user_verification(user_id)
+            # --- 2. SECRET TOKEN VERIFICATION ROUTE ---
+            active_secret_token = get_setting("today_check_token")
             
-            if not is_verified:
-                current_user_type = user_data.get("User", "normal") if user_data else "normal"
-                unique_base = generate_random_token()
-                token_v = f"v_verify_{unique_base}"
-                
-                dest_url = f"https://t.me/{BOT_USERNAME}?start={token_v}"
-                final_short_link = make_nested_link(["arolinks", "vplink", "instantlinks"], dest_url)
-                
-                keyboard = [[InlineKeyboardButton("🔐 Click Here to Verify (24h Access)", url=final_short_link)]]
+            if active_secret_token and raw_arg == active_secret_token:
+                now = datetime.utcnow()
+                today_str = now.strftime("%Y-%m-%d")
 
                 users_col.update_one(
-                    {"_id": user_id}, 
+                    {"_id": user_id},
                     {"$set": {
-                        "status": "unverified",
-                        "User": current_user_type,
-                        "verification_token": token_v,
-                        "ready_user": []
-                    }}, 
+                        "status": "verified",
+                        "User": "normal",
+                        "last_verified_date": today_str
+                    }},
                     upsert=True
                 )
+                user = users_col.find_one({"_id": user_id})
+                rem_limit = 3 - user.get("usage_count", 0)
+                await bot.send_message(chat_id=chat_id, text=f"✅ **Verification Successful!**\n\nAap Aaj 3 Links use kar sakte hain. Remaining Limit: **{rem_limit}/3** 🎉")
+                return
+
+            # --- 3. MAIN REQUEST & ACCESS CHECK ---
+            is_verified, status_code, user_data = check_user_verification(user_id)
+            
+            if status_code == "limit_exceeded":
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text="❌ **Daily Limit Exceeded!**\n\nAapne aaj ki **3 Links** ki limit poori kar li hai. Ab aap kal firse verification karke videos nikal sakte hain.\n\n👑 *Unlimited Videos ke liye Premium join karein!*"
+                )
+                return
+
+            if not is_verified:
+                today_link = get_setting("today_link")
+                if not today_link:
+                    await bot.send_message(chat_id=chat_id, text="⚠️ Admin ne abhi tak verification link set nahi kiya hai. Kripya baad me try karein.")
+                    return
+
+                keyboard = [[InlineKeyboardButton("🔐 Click Here to Verify (3 Links Access)", url=today_link)]]
 
                 await bot.send_message(
                     chat_id=chat_id,
-                    text="⚠️ **Access Denied!**\n\nAapka 24-hour verification pass active nahi hai. Bot verify karne ke liye niche link par click karein:",
+                    text="⚠️ **Access Denied!**\n\nBot ko use karne ke liye niche diye gaye button par click karke verify karein. Ek verification ke baad aap **3 Links** fetch kar sakte hain:",
                     reply_markup=InlineKeyboardMarkup(keyboard)
                 )
                 return
 
-            # --- REQUEST LIMIT & UNIQUE LINK CHECK ---
-            user_type = user_data.get("User", "normal") if user_data else "normal"
-            ready_list = user_data.get("ready_user", []) if user_data else []
-
-            if user_type != "premium":
-                if raw_arg and raw_arg not in ready_list and len(ready_list) >= 3:
-                    await bot.send_message(
-                        chat_id=chat_id, 
-                        text="⛔ **Daily Limit Reached!**\n\nAapne aaj ke 3 different videos complete kar liye hain. Agla verification expiry ke baad naya link verify karein ya Premium access buy karein."
-                    )
-                    return
-
-            # --- PROCESS AND DELIVER CONTENT ---
+            # --- 4. DELIVER CONTENT ---
             extracted_args = raw_arg.split('_') if "_" in raw_arg else [raw_arg]
-
-            # 1. BATCH MODE (4 Parameters: start_end_ch_parts)
+            
+            # Batch Mode
             if len(extracted_args) == 4:
-                if raw_arg and user_type != "premium":
-                    users_col.update_one({"_id": user_id}, {"$addToSet": {"ready_user": raw_arg}})
                 start_id, end_id, ch_num, total_parts = map(int, extracted_args)
                 video_list = list(range(start_id, end_id + 1))
                 target_ch = CHANNELS.get(str(ch_num))
                 if not target_ch: return
                 
+                # Consume 1 link limit
+                increment_user_usage(user_id)
+                
                 total_videos = len(video_list)
                 videos_per_part = math.ceil(total_videos / total_parts)
                 USER_STATES[user_id] = {"video_list": video_list, "target_ch": target_ch, "videos_per_part": videos_per_part, "current_part": 1, "total_parts": total_parts, "total_videos": total_videos}
-                await bot.send_message(chat_id=chat_id, text=f"📊 **Files Ready!**\nTotal Files: `{total_videos}`")
+                
+                u_data = users_col.find_one({"_id": user_id})
+                limit_info = "Unlimited (Premium)" if u_data.get("User") == "premium" else f"{3 - u_data.get('usage_count', 0)}/3 Left Today"
+                
+                await bot.send_message(chat_id=chat_id, text=f"📊 **Verification Valid!**\nTotal Files: `{total_videos}`\nLimit Status: `{limit_info}`\n\n⚠️ *Note: Saari files milne ke 5 mins baad auto-delete ho jayengi!*")
                 await send_video_batch(chat_id, bot, user_id)
-                return
                 
-            # 2. SINGLE FILE MODE (2 or 3 Parameters: file_id_ch_num or file_id_ch_num_extra)
-            elif len(extracted_args) in [2, 3]:
-                if raw_arg and user_type != "premium":
-                    users_col.update_one({"_id": user_id}, {"$addToSet": {"ready_user": raw_arg}})
-                
-                file_id = extracted_args[0]
-                ch_num = extracted_args[1]
+            # Single File Mode
+            elif len(extracted_args) == 2:
+                file_id, ch_num = extracted_args
                 target_ch = CHANNELS.get(str(ch_num))
-                
                 if target_ch:
-                    try:
-                        sent_msg = await bot.copy_message(chat_id=chat_id, from_chat_id=target_ch, message_id=int(file_id))
-                        now = datetime.utcnow()
-                        delete_at = now + timedelta(minutes=5)
-                        
-                        users_col.update_one(
-                            {"_id": user_id},
-                            {"$push": {
-                                "active_files": {
-                                    "message_id": sent_msg.message_id,
-                                    "give_time": now,
-                                    "delete_at": delete_at
-                                }
-                            }}
-                        )
-                    except Exception as e:
-                        await bot.send_message(chat_id=chat_id, text="⚠️ Requested video database channel par nahi mil saki.")
-                else:
-                    await bot.send_message(chat_id=chat_id, text="❌ Invalid Channel ID in link.")
-                return
-                
-            # 3. NO LINK / WELCOME COMMAND
+                    # Consume 1 link limit
+                    increment_user_usage(user_id)
+                    
+                    sent_msg = await bot.copy_message(chat_id=chat_id, from_chat_id=target_ch, message_id=int(file_id))
+                    
+                    now = datetime.utcnow()
+                    delete_at = now + timedelta(minutes=5)
+                    
+                    users_col.update_one(
+                        {"_id": user_id},
+                        {"$push": {
+                            "active_files": {
+                                "message_id": sent_msg.message_id,
+                                "give_time": now,
+                                "delete_at": delete_at
+                            }
+                        }}
+                    )
             else:
-                updated_user = users_col.find_one({"_id": user_id})
-                updated_ready = updated_user.get("ready_user", []) if updated_user else []
-                current_count = len(updated_ready) if user_type != "premium" else "Unlimited"
-                await bot.send_message(chat_id=chat_id, text=f"👋 **Welcome Back!**\nAapka verification active hai.\nUsed Videos: **{current_count}/3** (Different Links)")
+                u_data = users_col.find_one({"_id": user_id})
+                rem_limit = "Unlimited" if u_data.get("User") == "premium" else f"{3 - u_data.get('usage_count', 0)}/3 Links left"
+                await bot.send_message(chat_id=chat_id, text=f"👋 **Welcome Back!**\nAapka verification active hai. (Remaining Limit: {rem_limit})")
             return
     except Exception as err:
         print(f"❌ Error in message handler: {err}", flush=True)
         traceback.print_exc()
 
-# --- BUTTON CLICK HANDLER ---
+# --- BUTTON CLICK HANDLER FOR BATCH PARTS ---
 async def handle_button_clicks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user_id = query.from_user.id
     chat_id = query.message.chat_id
     await query.answer()
     
-    await clean_expired_files(context.bot, user_id, chat_id)
-    
-    is_verified, _ = check_user_verification(user_id)
-    if not is_verified:
-        await query.message.reply_text("⏰ Aapka session expire ho gaya hai! Kripya dobara verify karein.")
+    unsubscribed = await check_user_subscriptions(context.bot, user_id)
+    if unsubscribed:
+        await query.message.reply_text("❌ Aapne saare mandatory channels join nahi kiye hain!")
         return
+
+    await clean_expired_files(context.bot, user_id, chat_id)
 
     if query.data == "get_next_part":
         if user_id not in USER_STATES: return
@@ -422,12 +445,15 @@ async def send_video_batch(chat_id, bot, user_id):
             
     if current_part < total_parts:
         keyboard = [[InlineKeyboardButton(f"➡️ Get Part {current_part + 1}", callback_data="get_next_part")]]
-        await bot.send_message(chat_id=chat_id, text=f"⏸️ **Part {current_part} complete!**", reply_markup=InlineKeyboardMarkup(keyboard))
+        await bot.send_message(chat_id=chat_id, text=f"⏸️ **Part {current_part} complete!**\n*Bheji gayi files 5 mins baad automatic delete ho jayengi.*", reply_markup=InlineKeyboardMarkup(keyboard))
     else:
         await bot.send_message(chat_id=chat_id, text="🎉 **SAARI FILES COMPLETE HO GAYI!** ✅")
         if user_id in USER_STATES: del USER_STATES[user_id]
 
 # --- HANDLERS REGISTRATION ---
+ptb_app.add_handler(ChatJoinRequestHandler(handle_join_request))
+ptb_app.add_handler(CommandHandler("todaylink", handle_todaylink_command))
+ptb_app.add_handler(CommandHandler("todaycheck", handle_todaycheck_command))
 ptb_app.add_handler(CommandHandler("p", handle_premium_command))
 ptb_app.add_handler(CommandHandler("start", handle_text_messages))
 ptb_app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_text_messages))
@@ -435,7 +461,7 @@ ptb_app.add_handler(CallbackQueryHandler(handle_button_clicks))
 
 @app.route('/', methods=['GET'])
 def index():
-    return "Bot is running with Fixed Force Subscribe Check!", 200
+    return "Bot is running with Multi-Force Subscribe & Dynamic Daily Limits!", 200
 
 @app.route('/webhook', methods=['POST'])
 def telegram_webhook():
