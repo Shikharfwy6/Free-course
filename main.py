@@ -4,6 +4,7 @@ import sys
 import traceback
 import math
 import os
+import base64
 import telegram
 from datetime import datetime, timedelta
 import pytz  
@@ -63,6 +64,48 @@ ptb_app.bot._username = BOT_USERNAME
 ptb_app.bot._bot_user = telegram.User(id=int(BOT_TOKEN.split(':')[0]), is_bot=True, first_name="Getvideo", username=BOT_USERNAME)
 
 IST = pytz.timezone('Asia/Kolkata')
+
+# --- 🔐 DECODER FUNCTION FOR NEW FORMAT ---
+def decode_payload(encoded_str):
+    try:
+        if not encoded_str:
+            return ""
+        
+        # Agar purana format ya secret token hai (isme spaces ya binary nahi hai), toh direct return kar do
+        if " " not in encoded_str.replace("_", " ") and not all(c in '01 _=' for c in encoded_str):
+            # Try decoding base64 if it looks like single base64 string
+            try:
+                decoded_bytes = base64.b64decode(encoded_str + "==")
+                res = decoded_bytes.decode('utf-8')
+                if "_" in res or res.isdigit():
+                    return res
+            except:
+                pass
+            return encoded_str
+
+        # New format decoding: parts are separated by '_'
+        parts = encoded_str.split('_')
+        decoded_parts = []
+        
+        for part in parts:
+            sub_chunks = part.split()
+            char_str = ""
+            for chunk in sub_chunks:
+                try:
+                    # Base64 decode each chunk back to binary string
+                    b64_decoded = base64.b64decode(chunk + "==").decode('utf-8')
+                    # Binary to character conversion
+                    decimal_val = int(b64_decoded, 2)
+                    char_str += chr(decimal_val)
+                except Exception:
+                    # Fallback if chunk fails
+                    char_str += chunk
+            decoded_parts.append(char_str)
+            
+        return "_".join(decoded_parts)
+    except Exception as e:
+        print(f"⚠️ Decoding Error: {e}")
+        return encoded_str
 
 # --- 📩 CHAT JOIN REQUEST HANDLER ---
 async def handle_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -135,14 +178,12 @@ def check_user_verification(user_id):
         now = datetime.utcnow()
         
         if user:
-            # 👑 Premium users have no limits
             if user.get("User") == "premium":
                 return True, "verified", user
 
             last_date = user.get("last_verified_date")
             today_str = now.strftime("%Y-%m-%d")
 
-            # Date check to reset limit daily
             if last_date != today_str:
                 users_col.update_one(
                     {"_id": user_id},
@@ -151,7 +192,6 @@ def check_user_verification(user_id):
                 user["usage_count"] = 0
                 user["status"] = "unverified"
 
-            # Check daily usage limit for non-premium
             usage_count = user.get("usage_count", 0)
             if usage_count >= 3:
                 return False, "limit_exceeded", user
@@ -170,7 +210,6 @@ def increment_user_usage(user_id):
         new_count = user.get("usage_count", 0) + 1
         update_data = {"usage_count": new_count}
         
-        # After 3 links used, mark status unverified so they must verify next day
         if new_count >= 3:
             update_data["status"] = "unverified"
             
@@ -284,10 +323,13 @@ async def handle_text_messages(update: Update, context: ContextTypes.DEFAULT_TYP
             parts = text_message.split()
             raw_arg = parts[1] if len(parts) > 1 else ""
             
+            # 🔓 Decode the new payload format here
+            decoded_arg = decode_payload(raw_arg)
+            
             # --- 2. SECRET TOKEN VERIFICATION ROUTE ---
             active_secret_token = get_setting("today_check_token")
             
-            if active_secret_token and raw_arg == active_secret_token:
+            if active_secret_token and (raw_arg == active_secret_token or decoded_arg == active_secret_token):
                 now = datetime.utcnow()
                 today_str = now.strftime("%Y-%m-%d")
 
@@ -330,8 +372,8 @@ async def handle_text_messages(update: Update, context: ContextTypes.DEFAULT_TYP
                 )
                 return
 
-            # --- 4. DELIVER CONTENT ---
-            extracted_args = raw_arg.split('_') if "_" in raw_arg else [raw_arg]
+            # --- 4. DELIVER CONTENT USING DECODED ARG ---
+            extracted_args = decoded_arg.split('_') if "_" in decoded_arg else [decoded_arg]
             
             # Batch Mode
             if len(extracted_args) == 4:
@@ -340,7 +382,6 @@ async def handle_text_messages(update: Update, context: ContextTypes.DEFAULT_TYP
                 target_ch = CHANNELS.get(str(ch_num))
                 if not target_ch: return
                 
-                # Consume 1 link limit
                 increment_user_usage(user_id)
                 
                 total_videos = len(video_list)
@@ -358,7 +399,6 @@ async def handle_text_messages(update: Update, context: ContextTypes.DEFAULT_TYP
                 file_id, ch_num = extracted_args
                 target_ch = CHANNELS.get(str(ch_num))
                 if target_ch:
-                    # Consume 1 link limit
                     increment_user_usage(user_id)
                     
                     sent_msg = await bot.copy_message(chat_id=chat_id, from_chat_id=target_ch, message_id=int(file_id))
@@ -461,7 +501,7 @@ ptb_app.add_handler(CallbackQueryHandler(handle_button_clicks))
 
 @app.route('/', methods=['GET'])
 def index():
-    return "Bot is running with Multi-Force Subscribe & Dynamic Daily Limits!", 200
+    return "Bot is running with Encrypted Base64-Binary Start Payload!", 200
 
 @app.route('/webhook', methods=['POST'])
 def telegram_webhook():
