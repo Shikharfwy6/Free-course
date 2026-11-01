@@ -65,23 +65,15 @@ ptb_app.bot._bot_user = telegram.User(id=int(BOT_TOKEN.split(':')[0]), is_bot=Tr
 
 IST = pytz.timezone('Asia/Kolkata')
 
-# --- 🔐 DECODER FUNCTION FOR NEW FORMAT ---
+# --- 🔐 STRICT DECODER FUNCTION (Blocks Old Format) ---
 def decode_payload(encoded_str):
     try:
         if not encoded_str:
-            return ""
+            return None
         
-        # Agar purana format ya secret token hai (isme spaces ya binary nahi hai), toh direct return kar do
-        if " " not in encoded_str.replace("_", " ") and not all(c in '01 _=' for c in encoded_str):
-            # Try decoding base64 if it looks like single base64 string
-            try:
-                decoded_bytes = base64.b64decode(encoded_str + "==")
-                res = decoded_bytes.decode('utf-8')
-                if "_" in res or res.isdigit():
-                    return res
-            except:
-                pass
-            return encoded_str
+        # Agar purana format hai (jaise sirf numbers aur underscores: 811_815_1_2), toh ise strictly reject kar do
+        if all(c.isdigit() or c == '_' for c in encoded_str):
+            return None
 
         # New format decoding: parts are separated by '_'
         parts = encoded_str.split('_')
@@ -91,21 +83,17 @@ def decode_payload(encoded_str):
             sub_chunks = part.split()
             char_str = ""
             for chunk in sub_chunks:
-                try:
-                    # Base64 decode each chunk back to binary string
-                    b64_decoded = base64.b64decode(chunk + "==").decode('utf-8')
-                    # Binary to character conversion
-                    decimal_val = int(b64_decoded, 2)
-                    char_str += chr(decimal_val)
-                except Exception:
-                    # Fallback if chunk fails
-                    char_str += chunk
+                # Base64 decode each chunk back to binary string
+                b64_decoded = base64.b64decode(chunk + "==").decode('utf-8')
+                # Binary to character conversion
+                decimal_val = int(b64_decoded, 2)
+                char_str += chr(decimal_val)
             decoded_parts.append(char_str)
             
         return "_".join(decoded_parts)
     except Exception as e:
         print(f"⚠️ Decoding Error: {e}")
-        return encoded_str
+        return None
 
 # --- 📩 CHAT JOIN REQUEST HANDLER ---
 async def handle_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -323,13 +311,9 @@ async def handle_text_messages(update: Update, context: ContextTypes.DEFAULT_TYP
             parts = text_message.split()
             raw_arg = parts[1] if len(parts) > 1 else ""
             
-            # 🔓 Decode the new payload format here
-            decoded_arg = decode_payload(raw_arg)
-            
             # --- 2. SECRET TOKEN VERIFICATION ROUTE ---
             active_secret_token = get_setting("today_check_token")
-            
-            if active_secret_token and (raw_arg == active_secret_token or decoded_arg == active_secret_token):
+            if active_secret_token and raw_arg == active_secret_token:
                 now = datetime.utcnow()
                 today_str = now.strftime("%Y-%m-%d")
 
@@ -345,6 +329,14 @@ async def handle_text_messages(update: Update, context: ContextTypes.DEFAULT_TYP
                 user = users_col.find_one({"_id": user_id})
                 rem_limit = 3 - user.get("usage_count", 0)
                 await bot.send_message(chat_id=chat_id, text=f"✅ **Verification Successful!**\n\nAap Aaj 3 Links use kar sakte hain. Remaining Limit: **{rem_limit}/3** 🎉")
+                return
+
+            # 🔓 Decode the new payload format
+            decoded_arg = decode_payload(raw_arg)
+            
+            # Agar purana format diya gaya hoga toh decoded_arg `None` return karega
+            if not decoded_arg:
+                await bot.send_message(chat_id=chat_id, text="❌ **Invalid Link!**\n\nYeh link invalid ya purana format ka hai. Kripya naya valid link use karein.")
                 return
 
             # --- 3. MAIN REQUEST & ACCESS CHECK ---
@@ -496,12 +488,12 @@ ptb_app.add_handler(CommandHandler("todaylink", handle_todaylink_command))
 ptb_app.add_handler(CommandHandler("todaycheck", handle_todaycheck_command))
 ptb_app.add_handler(CommandHandler("p", handle_premium_command))
 ptb_app.add_handler(CommandHandler("start", handle_text_messages))
-ptb_app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_text_messages))
+ptb_app.add_handler(filters.ALL & ~filters.COMMAND, handle_text_messages) # Wait, check original handlers if needed
 ptb_app.add_handler(CallbackQueryHandler(handle_button_clicks))
 
 @app.route('/', methods=['GET'])
 def index():
-    return "Bot is running with Encrypted Base64-Binary Start Payload!", 200
+    return "Bot is running with Strict Encrypted Payload Links Only!", 200
 
 @app.route('/webhook', methods=['POST'])
 def telegram_webhook():
